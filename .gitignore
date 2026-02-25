@@ -1,0 +1,15 @@
+# Exported data (contains private conversations)
+*.zip
+*.html
+
+# Claude Code
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary audit files
+_audit_*/
+raw_upwork.html
