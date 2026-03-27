@@ -1,5 +1,5 @@
 // ==============================================================
-// Upwork Chat Exporter v2.3 - Full Conversation + File Downloads
+// Upwork Chat Exporter v2.4 - Full Conversation + File Downloads
 // ==============================================================
 //
 // FEATURES:
@@ -23,7 +23,7 @@
 (async function () {
   'use strict';
 
-  console.log('%c[UCE] Upwork Chat Exporter v2.3 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
+  console.log('%c[UCE] Upwork Chat Exporter v2.4 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
   console.log('[UCE] Timestamp:', new Date().toISOString());
   console.log('[UCE] Page URL:', window.location.href);
 
@@ -31,15 +31,14 @@
   // CONFIG
   // ============================================================
   const SCROLL_PAUSE_MS = 1500;
-  const SCROLL_TIMEOUT_MS = 8000;
-  const MAX_UNCHANGED_CYCLES = 6;
+  const SCROLL_TIMEOUT_MS = 10000;   // Wait longer for slow loads
   const FILE_FETCH_DELAY_MS = 300;
   const BATCH_SIZE = 3;              // Download files in small batches to avoid memory spikes
   const BATCH_PAUSE_MS = 3000;       // Pause between batches for GC
   const FETCH_TIMEOUT_MS = 30000;    // Abort individual fetches after 30s
   const MAX_FILES_PER_ZIP = 25;      // Split into multiple ZIPs to limit memory
 
-  console.log('[UCE] Config:', { SCROLL_PAUSE_MS, SCROLL_TIMEOUT_MS, MAX_UNCHANGED_CYCLES, FILE_FETCH_DELAY_MS, BATCH_SIZE, BATCH_PAUSE_MS, FETCH_TIMEOUT_MS, MAX_FILES_PER_ZIP });
+  console.log('[UCE] Config:', { SCROLL_PAUSE_MS, SCROLL_TIMEOUT_MS, FILE_FETCH_DELAY_MS, BATCH_SIZE, BATCH_PAUSE_MS, FETCH_TIMEOUT_MS, MAX_FILES_PER_ZIP });
 
   // Memory usage logger
   function logMemory(label) {
@@ -112,6 +111,45 @@
     ui.setStatus('Phase 1/3: Loading all messages...');
     ui.setProgress(5);
 
+    // --- Smart end-of-conversation detection ---
+    function checkAllStoriesLoaded() {
+      try {
+        // Check Vue/Nuxt store for allStoriesLoaded flag
+        const paths = [
+          () => window.$nuxt?.$store?.state?.stories?.allLoaded,
+          () => window.$nuxt?.$store?.state?.stories?.allStoriesLoaded,
+          () => window.$nuxt?.$store?.state?.messages?.allLoaded,
+          () => window.$nuxt?.$data?.allStoriesLoaded,
+          () => document.getElementById('story-viewport')?.__vue__?.allStoriesLoaded,
+          () => document.getElementById('story-viewport')?.__vue__?.$parent?.allStoriesLoaded,
+          () => document.querySelector('.up-d-room')?.__vue__?.$data?.allStoriesLoaded,
+          () => document.querySelector('.up-d-room')?.__vue__?.allStoriesLoaded,
+        ];
+        for (const pathFn of paths) {
+          const val = pathFn();
+          if (val === true) {
+            console.log('[UCE][Detect] Vue store confirms: allStoriesLoaded = true');
+            return true;
+          }
+        }
+      } catch (e) { /* ignore */ }
+      return null; // unknown
+    }
+
+    function isSpinnerActive() {
+      const container = document.getElementById('story-viewport') || document.querySelector('.scroll-wrapper');
+      if (!container) return false;
+      const spinners = container.querySelectorAll('[class*="spinner"], [class*="loading"], [aria-busy="true"]');
+      for (const s of spinners) {
+        const style = getComputedStyle(s);
+        if (style.display !== 'none' && style.visibility !== 'hidden' && s.offsetHeight > 0) {
+          console.log(`[UCE][Detect] Active spinner found: ${s.className}`);
+          return true;
+        }
+      }
+      return false;
+    }
+
     async function scrollToLoadAll() {
       console.log('[UCE][Scroll] Looking for scroll container...');
 
@@ -134,35 +172,36 @@
       });
 
       let previousCount = 0;
-      let unchangedCycles = 0;
       let totalLoaded = document.querySelectorAll('.up-d-story-item').length;
       let scrollCycle = 0;
+      let scrollSaturatedCount = 0;    // How many times scroll position didn't change
+      const MAX_SCROLL_STUCK = 15;     // Only stop after 15 consecutive stuck cycles
+      const SCROLL_STEP = 5000;        // Bigger jumps to scroll faster
 
       console.log(`[UCE][Scroll] Initial message count: ${totalLoaded}`);
+      console.log('[UCE][Scroll] Smart detection: will stop when scroll is physically saturated + no spinner + no new messages');
 
-      while (unchangedCycles < MAX_UNCHANGED_CYCLES) {
+      while (true) {
         scrollCycle++;
         totalLoaded = document.querySelectorAll('.up-d-story-item').length;
         ui.setDetail(`${totalLoaded} messages loaded... (cycle ${scrollCycle})`);
 
-        if (totalLoaded === previousCount) {
-          unchangedCycles++;
-          console.log(`[UCE][Scroll] Cycle ${scrollCycle}: No new messages (unchanged ${unchangedCycles}/${MAX_UNCHANGED_CYCLES}), count=${totalLoaded}`);
-        } else {
+        if (totalLoaded !== previousCount) {
           const newMsgs = totalLoaded - previousCount;
           console.log(`[UCE][Scroll] Cycle ${scrollCycle}: +${newMsgs} new messages, total=${totalLoaded}`);
-          unchangedCycles = 0;
+          scrollSaturatedCount = 0; // Reset — we're still loading
           previousCount = totalLoaded;
         }
 
-        // column-reverse: scrollTop=0 is bottom, negative is older messages
+        // --- Scroll attempt ---
         const scrollBefore = container.scrollTop;
-        const maxScroll = -(container.scrollHeight - container.clientHeight);
-        container.scrollTop = Math.min(container.scrollTop - 2000, maxScroll);
+        container.scrollTop = container.scrollTop - SCROLL_STEP;
         const scrollAfter = container.scrollTop;
-        console.log(`[UCE][Scroll] Cycle ${scrollCycle}: scrollTop ${scrollBefore.toFixed(0)} -> ${scrollAfter.toFixed(0)} (max=${maxScroll.toFixed(0)})`);
+        const scrollMoved = Math.abs(scrollAfter - scrollBefore) > 1;
 
-        // Wait for new content via MutationObserver + timeout
+        console.log(`[UCE][Scroll] Cycle ${scrollCycle}: scrollTop ${scrollBefore.toFixed(0)} -> ${scrollAfter.toFixed(0)} (moved=${scrollMoved})`);
+
+        // --- Wait for new content ---
         const waitResult = await new Promise((resolve) => {
           let resolved = false;
           const startWait = Date.now();
@@ -187,6 +226,43 @@
         });
 
         console.log(`[UCE][Scroll] Cycle ${scrollCycle}: Wait resolved by ${waitResult.reason} after ${waitResult.waitMs}ms`);
+
+        // --- Smart stop detection (3 signals) ---
+        const currentCount = document.querySelectorAll('.up-d-story-item').length;
+        const noNewMessages = currentCount === totalLoaded;
+        const spinner = isSpinnerActive();
+        const vueFlag = checkAllStoriesLoaded();
+
+        // Signal 1: Vue store says all loaded — trust it immediately
+        if (vueFlag === true && noNewMessages && !spinner) {
+          console.log(`%c[UCE][Scroll] STOP: Vue store confirms all stories loaded (${currentCount} messages)`, 'color:#14a800;font-weight:bold');
+          break;
+        }
+
+        // Signal 2: Scroll position saturated (can't go further) + no new messages + no spinner
+        if (!scrollMoved && noNewMessages) {
+          scrollSaturatedCount++;
+          console.log(`[UCE][Scroll] Cycle ${scrollCycle}: Scroll saturated + no new messages (${scrollSaturatedCount}/${MAX_SCROLL_STUCK})${spinner ? ' [spinner active, waiting...]' : ''}`);
+
+          // If spinner is active, keep waiting — Upwork is still loading
+          if (spinner) {
+            scrollSaturatedCount = Math.max(0, scrollSaturatedCount - 2); // Reset partially
+            console.log('[UCE][Scroll] Spinner detected, resetting saturation counter');
+          }
+
+          if (scrollSaturatedCount >= MAX_SCROLL_STUCK && !spinner) {
+            console.log(`%c[UCE][Scroll] STOP: Scroll saturated for ${MAX_SCROLL_STUCK} cycles, no spinner, no new messages`, 'color:#14a800;font-weight:bold');
+            break;
+          }
+        } else if (scrollMoved || !noNewMessages) {
+          scrollSaturatedCount = 0; // Reset if anything changed
+        }
+
+        // Safety: absolute max cycles to prevent infinite loop
+        if (scrollCycle > 500) {
+          console.warn('[UCE][Scroll] SAFETY STOP: 500 cycle limit reached');
+          break;
+        }
 
         await new Promise(r => setTimeout(r, SCROLL_PAUSE_MS));
         await waitForMemory(0.7, `scroll-cycle-${scrollCycle}`);
