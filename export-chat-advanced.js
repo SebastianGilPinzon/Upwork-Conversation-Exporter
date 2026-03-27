@@ -1,5 +1,5 @@
 // ==============================================================
-// Upwork Chat Exporter v2.6 - Full Conversation + File Downloads
+// Upwork Chat Exporter v2.7 - Full Conversation + File Downloads
 // ==============================================================
 //
 // FEATURES:
@@ -23,7 +23,7 @@
 (async function () {
   'use strict';
 
-  console.log('%c[UCE] Upwork Chat Exporter v2.6 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
+  console.log('%c[UCE] Upwork Chat Exporter v2.7 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
   console.log('[UCE] Timestamp:', new Date().toISOString());
   console.log('[UCE] Page URL:', window.location.href);
 
@@ -174,7 +174,7 @@
       let totalLoaded = document.querySelectorAll('.up-d-story-item').length;
       let scrollCycle = 0;
       let stuckCount = 0;           // Consecutive cycles with no progress at all
-      const MAX_STUCK = 40;         // Very patient — 40 stuck cycles before giving up
+      const MAX_STUCK = 25;         // Patient but not so much that we run out of memory
 
       console.log(`[UCE][Scroll] Initial message count: ${totalLoaded}`);
 
@@ -212,17 +212,6 @@
           scrollMoved = Math.abs(scrollAfter - scrollBefore) > 1;
         }
 
-        // If still didn't move, try small nudges (sometimes triggers IntersectionObserver)
-        if (!scrollMoved) {
-          for (const nudge of [-500, -1000, -100, -2000]) {
-            container.scrollTop = scrollBefore + nudge;
-            await new Promise(r => setTimeout(r, 200));
-          }
-          // Return to where we were to avoid jumping
-          container.scrollTop = scrollBefore;
-          scrollAfter = container.scrollTop;
-        }
-
         if (scrollCycle % 10 === 0) {
           console.log(`[UCE][Scroll] Cycle ${scrollCycle}: scrollTop=${scrollAfter.toFixed(0)}, items=${totalLoaded}, first="${getFirstDate()}", stuck=${stuckCount}`);
         }
@@ -248,8 +237,7 @@
           });
           observer.observe(container, { childList: true, subtree: true });
 
-          // When stuck, wait longer to give Upwork more time to load
-          const waitTime = stuckCount > 5 ? SCROLL_TIMEOUT_MS * 2 : SCROLL_TIMEOUT_MS;
+          const waitTime = SCROLL_TIMEOUT_MS;
           const timer = setTimeout(() => done('timeout'), waitTime);
         });
 
@@ -292,14 +280,12 @@
         }
 
         // Safety limit
-        if (scrollCycle > 800) {
+        if (scrollCycle > 500) {
           console.warn(`[UCE][Scroll] SAFETY STOP: 800 cycle limit (${currentCount} messages, first="${getFirstDate()}")`);
           break;
         }
 
-        // Pause — longer when stuck to give Upwork breathing room
-        const pauseTime = stuckCount > 10 ? SCROLL_PAUSE_MS * 2 : SCROLL_PAUSE_MS;
-        await new Promise(r => setTimeout(r, pauseTime));
+        await new Promise(r => setTimeout(r, SCROLL_PAUSE_MS));
         await waitForMemory(0.7, `scroll-cycle-${scrollCycle}`);
       }
 
