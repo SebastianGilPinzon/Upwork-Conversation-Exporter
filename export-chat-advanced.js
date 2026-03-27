@@ -1,5 +1,5 @@
 // ==============================================================
-// Upwork Chat Exporter v2.5 - Full Conversation + File Downloads
+// Upwork Chat Exporter v2.6 - Full Conversation + File Downloads
 // ==============================================================
 //
 // FEATURES:
@@ -23,7 +23,7 @@
 (async function () {
   'use strict';
 
-  console.log('%c[UCE] Upwork Chat Exporter v2.5 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
+  console.log('%c[UCE] Upwork Chat Exporter v2.6 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
   console.log('[UCE] Timestamp:', new Date().toISOString());
   console.log('[UCE] Page URL:', window.location.href);
 
@@ -173,35 +173,62 @@
       let previousCount = 0;
       let totalLoaded = document.querySelectorAll('.up-d-story-item').length;
       let scrollCycle = 0;
-      let scrollSaturatedCount = 0;    // How many times scroll position didn't change
-      const MAX_SCROLL_STUCK = 30;     // Only stop after 30 consecutive stuck cycles (very patient)
-      const SCROLL_STEP = 5000;        // Bigger jumps to scroll faster
+      let stuckCount = 0;           // Consecutive cycles with no progress at all
+      const MAX_STUCK = 40;         // Very patient — 40 stuck cycles before giving up
 
       console.log(`[UCE][Scroll] Initial message count: ${totalLoaded}`);
-      console.log('[UCE][Scroll] Smart detection: will stop when scroll is physically saturated + no spinner + no new messages');
+
+      // Log first date periodically
+      function getFirstDate() {
+        const h = document.querySelector('.story-day-header');
+        return h ? h.textContent?.trim() : '?';
+      }
 
       while (true) {
         scrollCycle++;
         totalLoaded = document.querySelectorAll('.up-d-story-item').length;
-        ui.setDetail(`${totalLoaded} messages loaded... (cycle ${scrollCycle})`);
+        ui.setDetail(`${totalLoaded} messages loaded... (cycle ${scrollCycle}, first: ${getFirstDate()})`);
 
         if (totalLoaded !== previousCount) {
           const newMsgs = totalLoaded - previousCount;
-          console.log(`[UCE][Scroll] Cycle ${scrollCycle}: +${newMsgs} new messages, total=${totalLoaded}`);
-          scrollSaturatedCount = 0; // Reset — we're still loading
+          console.log(`[UCE][Scroll] Cycle ${scrollCycle}: +${newMsgs} new messages, total=${totalLoaded}, first date="${getFirstDate()}"`);
+          stuckCount = 0;
           previousCount = totalLoaded;
         }
 
-        // --- Scroll attempt ---
+        // --- Scroll attempt: try multiple strategies ---
         const scrollBefore = container.scrollTop;
-        container.scrollTop = container.scrollTop - SCROLL_STEP;
-        const scrollAfter = container.scrollTop;
-        const scrollMoved = Math.abs(scrollAfter - scrollBefore) > 1;
 
-        console.log(`[UCE][Scroll] Cycle ${scrollCycle}: scrollTop ${scrollBefore.toFixed(0)} -> ${scrollAfter.toFixed(0)} (moved=${scrollMoved})`);
+        // Primary: big jump
+        container.scrollTop = container.scrollTop - 5000;
+        let scrollAfter = container.scrollTop;
+        let scrollMoved = Math.abs(scrollAfter - scrollBefore) > 1;
 
-        // --- Wait for new content ---
-        const waitResult = await new Promise((resolve) => {
+        // If big jump didn't move, try absolute minimum (force to very top)
+        if (!scrollMoved) {
+          const absMin = -(container.scrollHeight - container.clientHeight);
+          container.scrollTop = absMin;
+          scrollAfter = container.scrollTop;
+          scrollMoved = Math.abs(scrollAfter - scrollBefore) > 1;
+        }
+
+        // If still didn't move, try small nudges (sometimes triggers IntersectionObserver)
+        if (!scrollMoved) {
+          for (const nudge of [-500, -1000, -100, -2000]) {
+            container.scrollTop = scrollBefore + nudge;
+            await new Promise(r => setTimeout(r, 200));
+          }
+          // Return to where we were to avoid jumping
+          container.scrollTop = scrollBefore;
+          scrollAfter = container.scrollTop;
+        }
+
+        if (scrollCycle % 10 === 0) {
+          console.log(`[UCE][Scroll] Cycle ${scrollCycle}: scrollTop=${scrollAfter.toFixed(0)}, items=${totalLoaded}, first="${getFirstDate()}", stuck=${stuckCount}`);
+        }
+
+        // --- Wait for new content via MutationObserver ---
+        await new Promise((resolve) => {
           let resolved = false;
           const startWait = Date.now();
           const done = (reason) => {
@@ -221,102 +248,68 @@
           });
           observer.observe(container, { childList: true, subtree: true });
 
-          const timer = setTimeout(() => done('timeout'), SCROLL_TIMEOUT_MS);
+          // When stuck, wait longer to give Upwork more time to load
+          const waitTime = stuckCount > 5 ? SCROLL_TIMEOUT_MS * 2 : SCROLL_TIMEOUT_MS;
+          const timer = setTimeout(() => done('timeout'), waitTime);
         });
 
-        console.log(`[UCE][Scroll] Cycle ${scrollCycle}: Wait resolved by ${waitResult.reason} after ${waitResult.waitMs}ms`);
-
-        // --- Smart stop detection (3 signals) ---
+        // --- Determine if we made any progress this cycle ---
         const currentCount = document.querySelectorAll('.up-d-story-item').length;
-        const noNewMessages = currentCount === totalLoaded;
+        const gotNewMessages = currentCount > totalLoaded;
         const spinner = isSpinnerActive();
         const vueFlag = checkAllStoriesLoaded();
 
-        // Signal 1: Vue store says all loaded — trust it immediately
-        if (vueFlag === true && noNewMessages && !spinner) {
-          console.log(`%c[UCE][Scroll] STOP: Vue store confirms all stories loaded (${currentCount} messages)`, 'color:#14a800;font-weight:bold');
-          break;
-        }
-
-        // Signal 2: Scroll position saturated (can't go further) + no new messages + no spinner
-        if (!scrollMoved && noNewMessages) {
-          scrollSaturatedCount++;
-          console.log(`[UCE][Scroll] Cycle ${scrollCycle}: Scroll saturated + no new messages (${scrollSaturatedCount}/${MAX_SCROLL_STUCK})${spinner ? ' [spinner active, waiting...]' : ''}`);
-
-          // If spinner is active, keep waiting — Upwork is still loading
+        // If we got new messages, reset stuck counter
+        if (gotNewMessages) {
+          stuckCount = 0;
+        } else {
+          // No new messages — but check why
           if (spinner) {
-            scrollSaturatedCount = Math.max(0, scrollSaturatedCount - 2); // Reset partially
-            console.log('[UCE][Scroll] Spinner detected, resetting saturation counter');
+            // Spinner active = Upwork is loading, be patient, don't count as stuck
+            if (stuckCount > 0) stuckCount = Math.max(0, stuckCount - 1);
+            console.log(`[UCE][Scroll] Cycle ${scrollCycle}: Waiting for spinner... (not counting as stuck)`);
+          } else if (!scrollMoved) {
+            // Can't scroll AND no new messages AND no spinner
+            stuckCount++;
+          } else {
+            // Scroll moved but no new messages yet — half-count as stuck
+            stuckCount += 0.5;
           }
-
-          if (scrollSaturatedCount >= MAX_SCROLL_STUCK && !spinner) {
-            console.log(`%c[UCE][Scroll] STOP: Scroll saturated for ${MAX_SCROLL_STUCK} cycles, no spinner, no new messages`, 'color:#14a800;font-weight:bold');
-            break;
-          }
-        } else if (scrollMoved || !noNewMessages) {
-          scrollSaturatedCount = 0; // Reset if anything changed
         }
 
-        // Safety: absolute max cycles to prevent infinite loop
-        if (scrollCycle > 500) {
-          console.warn('[UCE][Scroll] SAFETY STOP: 500 cycle limit reached');
+        // --- Stop conditions ---
+
+        // Vue store confirms done
+        if (vueFlag === true && !gotNewMessages && !spinner) {
+          console.log(`%c[UCE][Scroll] STOP: Vue store confirms all stories loaded (${currentCount} messages, first="${getFirstDate()}")`, 'color:#14a800;font-weight:bold');
           break;
         }
 
-        await new Promise(r => setTimeout(r, SCROLL_PAUSE_MS));
+        // Truly stuck for many cycles
+        if (stuckCount >= MAX_STUCK && !spinner) {
+          console.log(`%c[UCE][Scroll] STOP: No progress for ${MAX_STUCK} cycles (${currentCount} messages, first="${getFirstDate()}")`, 'color:#14a800;font-weight:bold');
+          break;
+        }
+
+        // Safety limit
+        if (scrollCycle > 800) {
+          console.warn(`[UCE][Scroll] SAFETY STOP: 800 cycle limit (${currentCount} messages, first="${getFirstDate()}")`);
+          break;
+        }
+
+        // Pause — longer when stuck to give Upwork breathing room
+        const pauseTime = stuckCount > 10 ? SCROLL_PAUSE_MS * 2 : SCROLL_PAUSE_MS;
+        await new Promise(r => setTimeout(r, pauseTime));
         await waitForMemory(0.7, `scroll-cycle-${scrollCycle}`);
       }
 
       const finalCount = document.querySelectorAll('.up-d-story-item').length;
-      console.log(`%c[UCE][Scroll] COMPLETE: ${finalCount} total messages loaded in ${scrollCycle} cycles`, 'color:#14a800;font-weight:bold');
+      console.log(`%c[UCE][Scroll] COMPLETE: ${finalCount} total messages loaded in ${scrollCycle} cycles, first="${getFirstDate()}"`, 'color:#14a800;font-weight:bold');
       return finalCount;
     }
 
-    // --- Scroll with post-scroll verification and retry ---
-    const MAX_SCROLL_RETRIES = 3;
-    for (let attempt = 1; attempt <= MAX_SCROLL_RETRIES; attempt++) {
-      await scrollToLoadAll();
-      logMemory(`after-scroll-attempt-${attempt}`);
-
-      // Verify: check the earliest date header visible in DOM
-      const allDateHeaders = document.querySelectorAll('.story-day-header');
-      const firstDate = allDateHeaders.length > 0 ? allDateHeaders[0].textContent?.trim() : 'unknown';
-      const totalItems = document.querySelectorAll('.up-d-story-item').length;
-      console.log(`[UCE][Verify] Attempt ${attempt}: First date="${firstDate}", total items=${totalItems}`);
-
-      // Heuristic: if we have many messages but first date is recent, we probably didn't scroll far enough
-      // "Recent" = first date contains current year's month names from last 2 months
-      const isLikelyIncomplete = totalItems > 200 && allDateHeaders.length > 0 && (() => {
-        const firstDateText = firstDate.toLowerCase();
-        // If first date is in the last 60 days, probably incomplete for a long conversation
-        const now = new Date();
-        const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
-        const recentMonths = [
-          monthNames[now.getMonth()],
-          monthNames[(now.getMonth() - 1 + 12) % 12],
-          monthNames[(now.getMonth() - 2 + 12) % 12],
-        ];
-        // Also check short forms like "jan", "feb", "mar"
-        const hasRecentMonth = recentMonths.some(m => firstDateText.includes(m) || firstDateText.includes(m.substring(0, 3)));
-        return hasRecentMonth;
-      })();
-
-      if (isLikelyIncomplete && attempt < MAX_SCROLL_RETRIES) {
-        console.warn(`%c[UCE][Verify] WARNING: First date "${firstDate}" looks recent for ${totalItems} messages. Retrying scroll (attempt ${attempt + 1}/${MAX_SCROLL_RETRIES})...`, 'color:orange;font-weight:bold');
-        ui.setStatus(`Scroll retry ${attempt + 1}/${MAX_SCROLL_RETRIES}...`);
-        // Scroll back to bottom first, then retry from scratch
-        const container = document.getElementById('story-viewport') || document.querySelector('.scroll-wrapper');
-        if (container) container.scrollTop = 0;
-        await new Promise(r => setTimeout(r, 3000));
-      } else {
-        if (isLikelyIncomplete) {
-          console.warn(`[UCE][Verify] First date still looks recent after ${MAX_SCROLL_RETRIES} attempts. Proceeding with what we have.`);
-        } else {
-          console.log(`%c[UCE][Verify] First date "${firstDate}" looks good for ${totalItems} messages.`, 'color:#14a800;font-weight:bold');
-        }
-        break;
-      }
-    }
+    await scrollToLoadAll();
+    logMemory('after-scroll');
     ui.setProgress(33);
 
     // ============================================================
