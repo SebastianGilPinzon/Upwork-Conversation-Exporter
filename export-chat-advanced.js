@@ -1,5 +1,5 @@
 // ==============================================================
-// Upwork Chat Exporter v2.4 - Full Conversation + File Downloads
+// Upwork Chat Exporter v2.5 - Full Conversation + File Downloads
 // ==============================================================
 //
 // FEATURES:
@@ -23,7 +23,7 @@
 (async function () {
   'use strict';
 
-  console.log('%c[UCE] Upwork Chat Exporter v2.4 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
+  console.log('%c[UCE] Upwork Chat Exporter v2.5 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
   console.log('[UCE] Timestamp:', new Date().toISOString());
   console.log('[UCE] Page URL:', window.location.href);
 
@@ -36,9 +36,8 @@
   const BATCH_SIZE = 3;              // Download files in small batches to avoid memory spikes
   const BATCH_PAUSE_MS = 3000;       // Pause between batches for GC
   const FETCH_TIMEOUT_MS = 30000;    // Abort individual fetches after 30s
-  const MAX_FILES_PER_ZIP = 25;      // Split into multiple ZIPs to limit memory
 
-  console.log('[UCE] Config:', { SCROLL_PAUSE_MS, SCROLL_TIMEOUT_MS, FILE_FETCH_DELAY_MS, BATCH_SIZE, BATCH_PAUSE_MS, FETCH_TIMEOUT_MS, MAX_FILES_PER_ZIP });
+  console.log('[UCE] Config:', { SCROLL_PAUSE_MS, SCROLL_TIMEOUT_MS, FILE_FETCH_DELAY_MS, BATCH_SIZE, BATCH_PAUSE_MS, FETCH_TIMEOUT_MS });
 
   // Memory usage logger
   function logMemory(label) {
@@ -175,7 +174,7 @@
       let totalLoaded = document.querySelectorAll('.up-d-story-item').length;
       let scrollCycle = 0;
       let scrollSaturatedCount = 0;    // How many times scroll position didn't change
-      const MAX_SCROLL_STUCK = 15;     // Only stop after 15 consecutive stuck cycles
+      const MAX_SCROLL_STUCK = 30;     // Only stop after 30 consecutive stuck cycles (very patient)
       const SCROLL_STEP = 5000;        // Bigger jumps to scroll faster
 
       console.log(`[UCE][Scroll] Initial message count: ${totalLoaded}`);
@@ -273,8 +272,51 @@
       return finalCount;
     }
 
-    await scrollToLoadAll();
-    logMemory('after-scroll');
+    // --- Scroll with post-scroll verification and retry ---
+    const MAX_SCROLL_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_SCROLL_RETRIES; attempt++) {
+      await scrollToLoadAll();
+      logMemory(`after-scroll-attempt-${attempt}`);
+
+      // Verify: check the earliest date header visible in DOM
+      const allDateHeaders = document.querySelectorAll('.story-day-header');
+      const firstDate = allDateHeaders.length > 0 ? allDateHeaders[0].textContent?.trim() : 'unknown';
+      const totalItems = document.querySelectorAll('.up-d-story-item').length;
+      console.log(`[UCE][Verify] Attempt ${attempt}: First date="${firstDate}", total items=${totalItems}`);
+
+      // Heuristic: if we have many messages but first date is recent, we probably didn't scroll far enough
+      // "Recent" = first date contains current year's month names from last 2 months
+      const isLikelyIncomplete = totalItems > 200 && allDateHeaders.length > 0 && (() => {
+        const firstDateText = firstDate.toLowerCase();
+        // If first date is in the last 60 days, probably incomplete for a long conversation
+        const now = new Date();
+        const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+        const recentMonths = [
+          monthNames[now.getMonth()],
+          monthNames[(now.getMonth() - 1 + 12) % 12],
+          monthNames[(now.getMonth() - 2 + 12) % 12],
+        ];
+        // Also check short forms like "jan", "feb", "mar"
+        const hasRecentMonth = recentMonths.some(m => firstDateText.includes(m) || firstDateText.includes(m.substring(0, 3)));
+        return hasRecentMonth;
+      })();
+
+      if (isLikelyIncomplete && attempt < MAX_SCROLL_RETRIES) {
+        console.warn(`%c[UCE][Verify] WARNING: First date "${firstDate}" looks recent for ${totalItems} messages. Retrying scroll (attempt ${attempt + 1}/${MAX_SCROLL_RETRIES})...`, 'color:orange;font-weight:bold');
+        ui.setStatus(`Scroll retry ${attempt + 1}/${MAX_SCROLL_RETRIES}...`);
+        // Scroll back to bottom first, then retry from scratch
+        const container = document.getElementById('story-viewport') || document.querySelector('.scroll-wrapper');
+        if (container) container.scrollTop = 0;
+        await new Promise(r => setTimeout(r, 3000));
+      } else {
+        if (isLikelyIncomplete) {
+          console.warn(`[UCE][Verify] First date still looks recent after ${MAX_SCROLL_RETRIES} attempts. Proceeding with what we have.`);
+        } else {
+          console.log(`%c[UCE][Verify] First date "${firstDate}" looks good for ${totalItems} messages.`, 'color:#14a800;font-weight:bold');
+        }
+        break;
+      }
+    }
     ui.setProgress(33);
 
     // ============================================================
@@ -784,132 +826,88 @@
           console.log('[UCE][ZIP] JSZip already available');
         }
 
-        // --- Split files into ZIP chunks to limit memory ---
-        const zipChunks = [];
-        for (let i = 0; i < downloadableFiles.length; i += MAX_FILES_PER_ZIP) {
-          zipChunks.push(downloadableFiles.slice(i, i + MAX_FILES_PER_ZIP));
-        }
-        console.log(`[UCE][ZIP] Will create ${zipChunks.length} ZIP(s) (max ${MAX_FILES_PER_ZIP} files each)`);
+        const zip = new JSZip();
+        zip.file(`conversation-${dateStr}.txt`, txtOutput);
+        zip.file(`conversation-${dateStr}.json`, jsonOutput);
+        const filesFolder = zip.folder('files');
 
         const usedNames = new Set();
         const failedFiles = [];
-        let globalFileIdx = 0;
+        const totalFiles = downloadableFiles.length;
 
-        for (let chunkIdx = 0; chunkIdx < zipChunks.length; chunkIdx++) {
-          const chunk = zipChunks[chunkIdx];
-          const chunkLabel = zipChunks.length > 1 ? `-part${chunkIdx + 1}` : '';
+        // Download files in small batches with GC pauses
+        for (let batchStart = 0; batchStart < totalFiles; batchStart += BATCH_SIZE) {
+          const batchEnd = Math.min(batchStart + BATCH_SIZE, totalFiles);
+          const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+          const totalBatches = Math.ceil(totalFiles / BATCH_SIZE);
+          console.log(`[UCE][Download] --- Batch ${batchNum}/${totalBatches} (files ${batchStart + 1}-${batchEnd}) ---`);
+          logMemory(`batch-${batchNum}-start`);
 
-          console.log(`%c[UCE][ZIP] === ZIP ${chunkIdx + 1}/${zipChunks.length} (${chunk.length} files) ===`, 'color:#14a800;font-weight:bold');
-          logMemory(`zip-chunk-${chunkIdx + 1}-start`);
+          for (let i = batchStart; i < batchEnd; i++) {
+            const att = downloadableFiles[i];
+            const progressPct = 50 + Math.round(((i + 1) / totalFiles) * 40);
+            ui.setDetail(`File ${i + 1}/${totalFiles}: ${att.fileName}`);
+            ui.setProgress(progressPct);
 
-          let zip = new JSZip();
+            console.log(`[UCE][Download] ${i + 1}/${totalFiles}: "${att.fileName}" from ${att.downloadUrl.substring(0, 80)}...`);
 
-          // Add conversation text to first ZIP only
-          if (chunkIdx === 0) {
-            zip.file(`conversation-${dateStr}.txt`, txtOutput);
-            zip.file(`conversation-${dateStr}.json`, jsonOutput);
-          }
+            try {
+              const fetchStart = Date.now();
+              const controller = new AbortController();
+              const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-          const filesFolder = zip.folder('files');
+              const response = await fetch(att.downloadUrl, {
+                credentials: 'include',
+                signal: controller.signal
+              });
+              clearTimeout(timeout);
 
-          // Download files in small batches within this chunk
-          for (let batchStart = 0; batchStart < chunk.length; batchStart += BATCH_SIZE) {
-            const batchEnd = Math.min(batchStart + BATCH_SIZE, chunk.length);
-            const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
-            const totalBatches = Math.ceil(chunk.length / BATCH_SIZE);
-            console.log(`[UCE][Download] --- Batch ${batchNum}/${totalBatches} ---`);
-            logMemory(`batch-${batchNum}-start`);
-
-            for (let i = batchStart; i < batchEnd; i++) {
-              const att = chunk[i];
-              globalFileIdx++;
-              const progressPct = 50 + Math.round((globalFileIdx / downloadableFiles.length) * 40);
-              ui.setDetail(`File ${globalFileIdx}/${downloadableFiles.length}: ${att.fileName}${chunkLabel ? ` (ZIP ${chunkIdx + 1}/${zipChunks.length})` : ''}`);
-              ui.setProgress(progressPct);
-
-              console.log(`[UCE][Download] ${globalFileIdx}/${downloadableFiles.length}: "${att.fileName}" from ${att.downloadUrl.substring(0, 80)}...`);
-
-              try {
-                const fetchStart = Date.now();
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-                const response = await fetch(att.downloadUrl, {
-                  credentials: 'include',
-                  signal: controller.signal
-                });
-                clearTimeout(timeout);
-
-                if (!response.ok) {
-                  throw new Error(`HTTP ${response.status} ${response.statusText}`);
-                }
-
-                console.log(`[UCE][Download]   Response: ${response.status} ${response.statusText}, Content-Type: ${response.headers.get('content-type')}, Content-Length: ${response.headers.get('content-length')}`);
-
-                const buffer = await response.arrayBuffer();
-                const fetchMs = Date.now() - fetchStart;
-
-                // Handle duplicate names
-                let name = att.fileName || `file-${globalFileIdx}`;
-                if (usedNames.has(name)) {
-                  const ext = name.lastIndexOf('.') > 0 ? name.slice(name.lastIndexOf('.')) : '';
-                  const base = name.slice(0, name.length - ext.length);
-                  let counter = 2;
-                  while (usedNames.has(`${base}_${counter}${ext}`)) counter++;
-                  const oldName = name;
-                  name = `${base}_${counter}${ext}`;
-                  console.log(`[UCE][Download]   Renamed duplicate: "${oldName}" -> "${name}"`);
-                }
-                usedNames.add(name);
-
-                filesFolder.file(name, buffer);
-                totalDownloaded++;
-                console.log(`[UCE][Download]   OK: "${name}" (${(buffer.byteLength / 1024).toFixed(1)} KB, ${fetchMs}ms)`);
-              } catch (err) {
-                totalFailed++;
-                const reason = err.name === 'AbortError' ? `Timeout after ${FETCH_TIMEOUT_MS}ms` : err.message;
-                failedFiles.push({ fileName: att.fileName, url: att.downloadUrl, error: reason });
-                console.error(`[UCE][Download]   FAILED: "${att.fileName}" - ${reason}`);
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status} ${response.statusText}`);
               }
 
-              await new Promise(r => setTimeout(r, FILE_FETCH_DELAY_MS));
+              console.log(`[UCE][Download]   Response: ${response.status} ${response.statusText}, Content-Type: ${response.headers.get('content-type')}, Content-Length: ${response.headers.get('content-length')}`);
+
+              const buffer = await response.arrayBuffer();
+              const fetchMs = Date.now() - fetchStart;
+
+              // Handle duplicate names
+              let name = att.fileName || `file-${i + 1}`;
+              if (usedNames.has(name)) {
+                const ext = name.lastIndexOf('.') > 0 ? name.slice(name.lastIndexOf('.')) : '';
+                const base = name.slice(0, name.length - ext.length);
+                let counter = 2;
+                while (usedNames.has(`${base}_${counter}${ext}`)) counter++;
+                const oldName = name;
+                name = `${base}_${counter}${ext}`;
+                console.log(`[UCE][Download]   Renamed duplicate: "${oldName}" -> "${name}"`);
+              }
+              usedNames.add(name);
+
+              filesFolder.file(name, buffer);
+              totalDownloaded++;
+              console.log(`[UCE][Download]   OK: "${name}" (${(buffer.byteLength / 1024).toFixed(1)} KB, ${fetchMs}ms)`);
+            } catch (err) {
+              totalFailed++;
+              const reason = err.name === 'AbortError' ? `Timeout after ${FETCH_TIMEOUT_MS}ms` : err.message;
+              failedFiles.push({ fileName: att.fileName, url: att.downloadUrl, error: reason });
+              console.error(`[UCE][Download]   FAILED: "${att.fileName}" - ${reason}`);
             }
 
-            // Pause between batches for GC
-            if (batchEnd < chunk.length) {
-              logMemory(`batch-${batchNum}-end`);
-              await waitForMemory(0.7, `batch-${batchNum}`);
-              await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
-            }
+            await new Promise(r => setTimeout(r, FILE_FETCH_DELAY_MS));
           }
 
-          // Generate and download this ZIP chunk
-          logMemory(`zip-chunk-${chunkIdx + 1}-pre-generate`);
-          console.log(`[UCE][ZIP] Generating ZIP${chunkLabel}...`);
-          ui.setDetail(`Generating ZIP${chunkLabel}...`);
-
-          const zipStart = Date.now();
-          const zipBlob = await zip.generateAsync({
-            type: 'blob',
-            compression: 'DEFLATE',
-            compressionOptions: { level: 1 }
-          });
-          const zipMs = Date.now() - zipStart;
-          console.log(`[UCE][ZIP] ZIP${chunkLabel} generated: ${(zipBlob.size / 1024 / 1024).toFixed(2)} MB in ${zipMs}ms`);
-
-          downloadBlob(zipBlob, `upwork-export-${safeName}-${dateStr}${chunkLabel}.zip`);
-          console.log(`[UCE][ZIP] ZIP${chunkLabel} download triggered`);
-
-          // Release ZIP memory before next chunk
-          zip = null;
-          logMemory(`zip-chunk-${chunkIdx + 1}-released`);
-          await waitForMemory(0.6, 'between-zips');
-          await new Promise(r => setTimeout(r, 2000));
+          // Pause between batches for GC
+          if (batchEnd < totalFiles) {
+            logMemory(`batch-${batchNum}-end`);
+            await waitForMemory(0.7, `batch-${batchNum}`);
+            await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
+          }
         }
 
         console.log(`[UCE][Download] --- Download Summary ---`);
-        console.log(`[UCE][Download] OK: ${totalDownloaded}/${downloadableFiles.length}`);
-        console.log(`[UCE][Download] Failed: ${totalFailed}/${downloadableFiles.length}`);
+        console.log(`[UCE][Download] OK: ${totalDownloaded}/${totalFiles}`);
+        console.log(`[UCE][Download] Failed: ${totalFailed}/${totalFiles}`);
 
         if (failedFiles.length > 0) {
           console.warn('[UCE][Download] Failed files:');
@@ -917,6 +915,24 @@
             console.warn(`  ${i + 1}. "${f.fileName}" - ${f.error}`);
           });
         }
+
+        // Generate single ZIP
+        logMemory('pre-zip-generation');
+        console.log('[UCE][ZIP] Generating ZIP...');
+        ui.setDetail('Generating ZIP...');
+        ui.setProgress(92);
+
+        const zipStart = Date.now();
+        const zipBlob = await zip.generateAsync({
+          type: 'blob',
+          compression: 'DEFLATE',
+          compressionOptions: { level: 1 }
+        });
+        const zipMs = Date.now() - zipStart;
+        console.log(`[UCE][ZIP] ZIP generated: ${(zipBlob.size / 1024 / 1024).toFixed(2)} MB in ${zipMs}ms`);
+
+        downloadBlob(zipBlob, `upwork-export-${safeName}-${dateStr}.zip`);
+        console.log('[UCE][ZIP] ZIP download triggered');
 
       } catch (downloadErr) {
         console.error('%c[UCE] FILE DOWNLOAD PHASE FAILED', 'color:red;font-weight:bold');
