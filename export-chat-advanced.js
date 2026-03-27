@@ -1,5 +1,5 @@
 // ==============================================================
-// Upwork Chat Exporter v2.2 - Full Conversation + File Downloads
+// Upwork Chat Exporter v2.3 - Full Conversation + File Downloads
 // ==============================================================
 //
 // FEATURES:
@@ -23,7 +23,7 @@
 (async function () {
   'use strict';
 
-  console.log('%c[UCE] Upwork Chat Exporter v2.2 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
+  console.log('%c[UCE] Upwork Chat Exporter v2.3 starting...', 'color:#14a800;font-weight:bold;font-size:14px');
   console.log('[UCE] Timestamp:', new Date().toISOString());
   console.log('[UCE] Page URL:', window.location.href);
 
@@ -34,11 +34,12 @@
   const SCROLL_TIMEOUT_MS = 8000;
   const MAX_UNCHANGED_CYCLES = 6;
   const FILE_FETCH_DELAY_MS = 300;
-  const BATCH_SIZE = 5;              // Download files in batches to avoid memory spikes
-  const BATCH_PAUSE_MS = 2000;       // Pause between batches for GC
+  const BATCH_SIZE = 3;              // Download files in small batches to avoid memory spikes
+  const BATCH_PAUSE_MS = 3000;       // Pause between batches for GC
   const FETCH_TIMEOUT_MS = 30000;    // Abort individual fetches after 30s
+  const MAX_FILES_PER_ZIP = 25;      // Split into multiple ZIPs to limit memory
 
-  console.log('[UCE] Config:', { SCROLL_PAUSE_MS, SCROLL_TIMEOUT_MS, MAX_UNCHANGED_CYCLES, FILE_FETCH_DELAY_MS, BATCH_SIZE, BATCH_PAUSE_MS, FETCH_TIMEOUT_MS });
+  console.log('[UCE] Config:', { SCROLL_PAUSE_MS, SCROLL_TIMEOUT_MS, MAX_UNCHANGED_CYCLES, FILE_FETCH_DELAY_MS, BATCH_SIZE, BATCH_PAUSE_MS, FETCH_TIMEOUT_MS, MAX_FILES_PER_ZIP });
 
   // Memory usage logger
   function logMemory(label) {
@@ -48,6 +49,30 @@
     }
   }
   logMemory('startup');
+
+  // Memory threshold monitor - pauses if memory exceeds threshold to allow GC
+  async function waitForMemory(thresholdPct = 0.7, label = '') {
+    if (!performance.memory) return;
+    let waited = 0;
+    while (performance.memory.usedJSHeapSize / performance.memory.jsHeapSizeLimit > thresholdPct && waited < 30000) {
+      const pct = ((performance.memory.usedJSHeapSize / performance.memory.jsHeapSizeLimit) * 100).toFixed(0);
+      console.warn(`[UCE][Memory] ${label}: ${pct}% exceeds ${thresholdPct * 100}% threshold, pausing for GC...`);
+      await new Promise(r => setTimeout(r, 2000));
+      waited += 2000;
+    }
+  }
+
+  // Utility: download a Blob as a file
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
 
   // ============================================================
   // UI: Progress overlay
@@ -164,6 +189,7 @@
         console.log(`[UCE][Scroll] Cycle ${scrollCycle}: Wait resolved by ${waitResult.reason} after ${waitResult.waitMs}ms`);
 
         await new Promise(r => setTimeout(r, SCROLL_PAUSE_MS));
+        await waitForMemory(0.7, `scroll-cycle-${scrollCycle}`);
       }
 
       const finalCount = document.querySelectorAll('.up-d-story-item').length;
@@ -527,13 +553,32 @@
     logMemory('after-extraction');
     console.log(`%c[UCE] Extracted ${data.messages.length} messages, ${data.attachments.length} file attachments`, 'color:#14a800;font-weight:bold');
     ui.setDetail(`${data.messages.length} messages, ${data.attachments.length} files found`);
-    ui.setProgress(50);
+    ui.setProgress(40);
 
     // ============================================================
-    // PHASE 3: Filter attachments & download
+    // MEMORY CLEANUP: Unload images + strip Vue refs
     // ============================================================
-    console.log('%c[UCE] === PHASE 3: Filter and download files ===', 'color:#14a800;font-weight:bold');
-    ui.setStatus('Phase 3/3: Downloading files...');
+    console.log('[UCE][Cleanup] Unloading images to free GPU memory...');
+    document.querySelectorAll('#story-viewport img, .scroll-wrapper img').forEach(img => {
+      img.dataset.originalSrc = img.src;
+      img.src = '';
+      img.srcset = '';
+    });
+    logMemory('after-image-unload');
+
+    console.log('[UCE][Cleanup] Stripping Vue references from DOM...');
+    document.querySelectorAll('.up-d-story-item').forEach(el => {
+      delete el.__vue__;
+      delete el.__vue_app__;
+    });
+    logMemory('after-vue-strip');
+    await waitForMemory(0.7, 'post-cleanup');
+
+    // ============================================================
+    // PHASE 3A: Filter, format, and SAVE TEXT IMMEDIATELY
+    // ============================================================
+    console.log('%c[UCE] === PHASE 3A: Save text backup (crash-proof) ===', 'color:#14a800;font-weight:bold');
+    ui.setStatus('Phase 3/4: Saving text backup...');
 
     // --- Filter out videos ---
     const VIDEO_EXT = ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.flv', '.wmv', '.m4v'];
@@ -553,7 +598,7 @@
       return true;
     });
 
-    // --- Deduplicate by URL (safety net for any remaining duplicates) ---
+    // --- Deduplicate by URL ---
     const seenUrls = new Set();
     const preDedupCount = downloadableFiles.length;
     downloadableFiles = downloadableFiles.filter(att => {
@@ -576,18 +621,18 @@
     }
 
     // --- Format text output ---
-    function formatTxt(data) {
+    function formatTxt(d, fileList) {
       const lines = [];
       lines.push('='.repeat(60));
-      lines.push(`UPWORK CONVERSATION: ${data.chatTitle}`);
-      if (data.chatSubtitle) lines.push(data.chatSubtitle);
+      lines.push(`UPWORK CONVERSATION: ${d.chatTitle}`);
+      if (d.chatSubtitle) lines.push(d.chatSubtitle);
       lines.push(`Exported: ${new Date().toLocaleString()}`);
-      lines.push(`Total messages: ${data.messages.length}`);
-      lines.push(`File attachments: ${downloadableFiles.length}`);
+      lines.push(`Total messages: ${d.messages.length}`);
+      lines.push(`File attachments: ${fileList.length}`);
       lines.push('='.repeat(60));
 
       let lastDate = '';
-      for (const msg of data.messages) {
+      for (const msg of d.messages) {
         if (msg.date && msg.date !== lastDate) {
           lines.push('');
           lines.push(`--- ${msg.date} ---`);
@@ -601,12 +646,12 @@
         if (msg.isNewSender) lines.push('');
       }
 
-      if (downloadableFiles.length > 0) {
+      if (fileList.length > 0) {
         lines.push('');
         lines.push('='.repeat(60));
         lines.push('ATTACHED FILES');
         lines.push('='.repeat(60));
-        downloadableFiles.forEach((f, i) => {
+        fileList.forEach((f, i) => {
           lines.push(`${i + 1}. ${f.fileName} ${f.fileSize ? '(' + f.fileSize + ')' : ''} - from ${f.sender} on ${f.date}`);
         });
       }
@@ -614,22 +659,44 @@
       return lines.join('\n');
     }
 
-    const txtOutput = formatTxt(data);
-    const jsonOutput = JSON.stringify({ ...data, downloadableFiles, excludedFiles }, null, 2);
     const safeName = data.chatTitle.replace(/[^a-zA-Z0-9]/g, '_');
     const dateStr = new Date().toISOString().slice(0, 10);
+    const txtOutput = formatTxt(data, downloadableFiles);
+    const jsonOutput = JSON.stringify({ ...data, downloadableFiles, excludedFiles }, null, 2);
 
     console.log(`[UCE][Output] TXT length: ${txtOutput.length} chars`);
     console.log(`[UCE][Output] JSON length: ${jsonOutput.length} chars`);
-    console.log(`[UCE][Output] Safe filename: ${safeName}`);
 
-    // --- Download files as ZIP using JSZip ---
+    // --- IMMEDIATELY download TXT as crash-proof backup ---
+    downloadBlob(
+      new Blob([txtOutput], { type: 'text/plain;charset=utf-8' }),
+      `upwork-chat-${safeName}-${dateStr}.txt`
+    );
+    console.log('%c[UCE] TEXT BACKUP SAVED - conversation is safe even if file downloads crash', 'color:#14a800;font-weight:bold');
+
+    // Also copy to clipboard as second backup
+    try {
+      await navigator.clipboard.writeText(txtOutput);
+      console.log('[UCE] Text also copied to clipboard');
+    } catch (e) {
+      console.warn('[UCE] Clipboard copy failed:', e.message);
+    }
+
+    ui.setProgress(50);
+
+    // ============================================================
+    // PHASE 3B: Download files (isolated try/catch - crash-safe)
+    // ============================================================
+    let totalDownloaded = 0;
+    let totalFailed = 0;
+
     if (downloadableFiles.length > 0) {
-      console.log('[UCE][ZIP] Loading JSZip library...');
-      ui.setDetail('Loading JSZip library...');
+      try {
+        console.log('%c[UCE] === PHASE 3B: Download files ===', 'color:#14a800;font-weight:bold');
+        ui.setStatus('Phase 4/4: Downloading files...');
 
-      if (!window.JSZip) {
-        try {
+        // Load JSZip
+        if (!window.JSZip) {
           await new Promise((resolve, reject) => {
             const script = document.createElement('script');
             script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
@@ -637,194 +704,168 @@
             script.onerror = (e) => { console.error('[UCE][ZIP] FAILED to load JSZip:', e); reject(new Error('Failed to load JSZip from CDN')); };
             document.head.appendChild(script);
           });
-        } catch (e) {
-          console.error('[UCE][ZIP] JSZip load error:', e);
-          throw new Error('Failed to load JSZip library. Cannot create ZIP file. Check your internet connection.');
+        } else {
+          console.log('[UCE][ZIP] JSZip already available');
         }
-      } else {
-        console.log('[UCE][ZIP] JSZip already available');
-      }
 
-      const zip = new JSZip();
-      const usedNames = new Set();
-      let downloaded = 0;
-      let failed = 0;
-      const failedFiles = [];
+        // --- Split files into ZIP chunks to limit memory ---
+        const zipChunks = [];
+        for (let i = 0; i < downloadableFiles.length; i += MAX_FILES_PER_ZIP) {
+          zipChunks.push(downloadableFiles.slice(i, i + MAX_FILES_PER_ZIP));
+        }
+        console.log(`[UCE][ZIP] Will create ${zipChunks.length} ZIP(s) (max ${MAX_FILES_PER_ZIP} files each)`);
 
-      zip.file(`conversation-${dateStr}.txt`, txtOutput);
-      zip.file(`conversation-${dateStr}.json`, jsonOutput);
-      console.log('[UCE][ZIP] Added conversation TXT and JSON to ZIP');
+        const usedNames = new Set();
+        const failedFiles = [];
+        let globalFileIdx = 0;
 
-      const filesFolder = zip.folder('files');
+        for (let chunkIdx = 0; chunkIdx < zipChunks.length; chunkIdx++) {
+          const chunk = zipChunks[chunkIdx];
+          const chunkLabel = zipChunks.length > 1 ? `-part${chunkIdx + 1}` : '';
 
-      // Download in batches to prevent memory spikes that crash the tab
-      const totalFiles = downloadableFiles.length;
-      for (let batchStart = 0; batchStart < totalFiles; batchStart += BATCH_SIZE) {
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, totalFiles);
-        const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
-        const totalBatches = Math.ceil(totalFiles / BATCH_SIZE);
-        console.log(`[UCE][Download] --- Batch ${batchNum}/${totalBatches} (files ${batchStart + 1}-${batchEnd}) ---`);
-        logMemory(`batch-${batchNum}-start`);
+          console.log(`%c[UCE][ZIP] === ZIP ${chunkIdx + 1}/${zipChunks.length} (${chunk.length} files) ===`, 'color:#14a800;font-weight:bold');
+          logMemory(`zip-chunk-${chunkIdx + 1}-start`);
 
-        for (let i = batchStart; i < batchEnd; i++) {
-          const att = downloadableFiles[i];
-          const progressPct = 50 + Math.round((i / totalFiles) * 40);
-          ui.setDetail(`Downloading file ${i + 1}/${totalFiles}: ${att.fileName} (batch ${batchNum}/${totalBatches})`);
-          ui.setProgress(progressPct);
+          let zip = new JSZip();
 
-          console.log(`[UCE][Download] ${i + 1}/${totalFiles}: "${att.fileName}" from ${att.downloadUrl.substring(0, 80)}...`);
-
-          try {
-            const fetchStart = Date.now();
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-            const response = await fetch(att.downloadUrl, {
-              credentials: 'include',
-              signal: controller.signal
-            });
-            clearTimeout(timeout);
-
-            if (!response.ok) {
-              throw new Error(`HTTP ${response.status} ${response.statusText}`);
-            }
-
-            console.log(`[UCE][Download]   Response: ${response.status} ${response.statusText}, Content-Type: ${response.headers.get('content-type')}, Content-Length: ${response.headers.get('content-length')}`);
-
-            // Use arrayBuffer instead of blob for lower memory overhead
-            const buffer = await response.arrayBuffer();
-            const fetchMs = Date.now() - fetchStart;
-
-            // Handle duplicate names
-            let name = att.fileName || `file-${i}`;
-            if (usedNames.has(name)) {
-              const ext = name.lastIndexOf('.') > 0 ? name.slice(name.lastIndexOf('.')) : '';
-              const base = name.slice(0, name.length - ext.length);
-              let counter = 2;
-              while (usedNames.has(`${base}_${counter}${ext}`)) counter++;
-              const oldName = name;
-              name = `${base}_${counter}${ext}`;
-              console.log(`[UCE][Download]   Renamed duplicate: "${oldName}" -> "${name}"`);
-            }
-            usedNames.add(name);
-
-            filesFolder.file(name, buffer);
-            downloaded++;
-            console.log(`[UCE][Download]   OK: "${name}" (${(buffer.byteLength / 1024).toFixed(1)} KB, ${fetchMs}ms)`);
-          } catch (err) {
-            failed++;
-            const reason = err.name === 'AbortError' ? `Timeout after ${FETCH_TIMEOUT_MS}ms` : err.message;
-            failedFiles.push({ fileName: att.fileName, url: att.downloadUrl, error: reason });
-            console.error(`[UCE][Download]   FAILED: "${att.fileName}" - ${reason}`);
-            console.error(`[UCE][Download]   URL was: ${att.downloadUrl}`);
+          // Add conversation text to first ZIP only
+          if (chunkIdx === 0) {
+            zip.file(`conversation-${dateStr}.txt`, txtOutput);
+            zip.file(`conversation-${dateStr}.json`, jsonOutput);
           }
 
-          await new Promise(r => setTimeout(r, FILE_FETCH_DELAY_MS));
+          const filesFolder = zip.folder('files');
+
+          // Download files in small batches within this chunk
+          for (let batchStart = 0; batchStart < chunk.length; batchStart += BATCH_SIZE) {
+            const batchEnd = Math.min(batchStart + BATCH_SIZE, chunk.length);
+            const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+            const totalBatches = Math.ceil(chunk.length / BATCH_SIZE);
+            console.log(`[UCE][Download] --- Batch ${batchNum}/${totalBatches} ---`);
+            logMemory(`batch-${batchNum}-start`);
+
+            for (let i = batchStart; i < batchEnd; i++) {
+              const att = chunk[i];
+              globalFileIdx++;
+              const progressPct = 50 + Math.round((globalFileIdx / downloadableFiles.length) * 40);
+              ui.setDetail(`File ${globalFileIdx}/${downloadableFiles.length}: ${att.fileName}${chunkLabel ? ` (ZIP ${chunkIdx + 1}/${zipChunks.length})` : ''}`);
+              ui.setProgress(progressPct);
+
+              console.log(`[UCE][Download] ${globalFileIdx}/${downloadableFiles.length}: "${att.fileName}" from ${att.downloadUrl.substring(0, 80)}...`);
+
+              try {
+                const fetchStart = Date.now();
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+                const response = await fetch(att.downloadUrl, {
+                  credentials: 'include',
+                  signal: controller.signal
+                });
+                clearTimeout(timeout);
+
+                if (!response.ok) {
+                  throw new Error(`HTTP ${response.status} ${response.statusText}`);
+                }
+
+                console.log(`[UCE][Download]   Response: ${response.status} ${response.statusText}, Content-Type: ${response.headers.get('content-type')}, Content-Length: ${response.headers.get('content-length')}`);
+
+                const buffer = await response.arrayBuffer();
+                const fetchMs = Date.now() - fetchStart;
+
+                // Handle duplicate names
+                let name = att.fileName || `file-${globalFileIdx}`;
+                if (usedNames.has(name)) {
+                  const ext = name.lastIndexOf('.') > 0 ? name.slice(name.lastIndexOf('.')) : '';
+                  const base = name.slice(0, name.length - ext.length);
+                  let counter = 2;
+                  while (usedNames.has(`${base}_${counter}${ext}`)) counter++;
+                  const oldName = name;
+                  name = `${base}_${counter}${ext}`;
+                  console.log(`[UCE][Download]   Renamed duplicate: "${oldName}" -> "${name}"`);
+                }
+                usedNames.add(name);
+
+                filesFolder.file(name, buffer);
+                totalDownloaded++;
+                console.log(`[UCE][Download]   OK: "${name}" (${(buffer.byteLength / 1024).toFixed(1)} KB, ${fetchMs}ms)`);
+              } catch (err) {
+                totalFailed++;
+                const reason = err.name === 'AbortError' ? `Timeout after ${FETCH_TIMEOUT_MS}ms` : err.message;
+                failedFiles.push({ fileName: att.fileName, url: att.downloadUrl, error: reason });
+                console.error(`[UCE][Download]   FAILED: "${att.fileName}" - ${reason}`);
+              }
+
+              await new Promise(r => setTimeout(r, FILE_FETCH_DELAY_MS));
+            }
+
+            // Pause between batches for GC
+            if (batchEnd < chunk.length) {
+              logMemory(`batch-${batchNum}-end`);
+              await waitForMemory(0.7, `batch-${batchNum}`);
+              await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
+            }
+          }
+
+          // Generate and download this ZIP chunk
+          logMemory(`zip-chunk-${chunkIdx + 1}-pre-generate`);
+          console.log(`[UCE][ZIP] Generating ZIP${chunkLabel}...`);
+          ui.setDetail(`Generating ZIP${chunkLabel}...`);
+
+          const zipStart = Date.now();
+          const zipBlob = await zip.generateAsync({
+            type: 'blob',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 1 }
+          });
+          const zipMs = Date.now() - zipStart;
+          console.log(`[UCE][ZIP] ZIP${chunkLabel} generated: ${(zipBlob.size / 1024 / 1024).toFixed(2)} MB in ${zipMs}ms`);
+
+          downloadBlob(zipBlob, `upwork-export-${safeName}-${dateStr}${chunkLabel}.zip`);
+          console.log(`[UCE][ZIP] ZIP${chunkLabel} download triggered`);
+
+          // Release ZIP memory before next chunk
+          zip = null;
+          logMemory(`zip-chunk-${chunkIdx + 1}-released`);
+          await waitForMemory(0.6, 'between-zips');
+          await new Promise(r => setTimeout(r, 2000));
         }
 
-        // Pause between batches to allow garbage collection
-        if (batchEnd < totalFiles) {
-          console.log(`[UCE][Download] Batch ${batchNum} done. Pausing ${BATCH_PAUSE_MS}ms for GC...`);
-          logMemory(`batch-${batchNum}-end`);
-          await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
+        console.log(`[UCE][Download] --- Download Summary ---`);
+        console.log(`[UCE][Download] OK: ${totalDownloaded}/${downloadableFiles.length}`);
+        console.log(`[UCE][Download] Failed: ${totalFailed}/${downloadableFiles.length}`);
+
+        if (failedFiles.length > 0) {
+          console.warn('[UCE][Download] Failed files:');
+          failedFiles.forEach((f, i) => {
+            console.warn(`  ${i + 1}. "${f.fileName}" - ${f.error}`);
+          });
         }
-      }
 
-      console.log(`[UCE][Download] --- Download Summary ---`);
-      console.log(`[UCE][Download] OK: ${downloaded}/${downloadableFiles.length}`);
-      console.log(`[UCE][Download] Failed: ${failed}/${downloadableFiles.length}`);
-
-      if (failedFiles.length > 0) {
-        console.warn('[UCE][Download] Failed files:');
-        failedFiles.forEach((f, i) => {
-          console.warn(`  ${i + 1}. "${f.fileName}" - ${f.error}`);
-          console.warn(`     URL: ${f.url}`);
-        });
-      }
-
-      logMemory('pre-zip-generation');
-      console.log('[UCE][ZIP] Generating ZIP file (low compression to save memory)...');
-      ui.setDetail('Generating ZIP file...');
-      ui.setProgress(92);
-
-      try {
-        const zipStart = Date.now();
-        const zipBlob = await zip.generateAsync({
-          type: 'blob',
-          compression: 'DEFLATE',
-          compressionOptions: { level: 1 }  // Low compression = less memory + faster
-        });
-        const zipMs = Date.now() - zipStart;
-
-        console.log(`[UCE][ZIP] ZIP generated: ${(zipBlob.size / 1024 / 1024).toFixed(2)} MB in ${zipMs}ms`);
-
-        const zipUrl = URL.createObjectURL(zipBlob);
-        const zipLink = document.createElement('a');
-        zipLink.href = zipUrl;
-        zipLink.download = `upwork-export-${safeName}-${dateStr}.zip`;
-        document.body.appendChild(zipLink);
-        zipLink.click();
-        document.body.removeChild(zipLink);
-        URL.revokeObjectURL(zipUrl);
-
-        console.log(`[UCE][ZIP] ZIP download triggered: upwork-export-${safeName}-${dateStr}.zip`);
-      } catch (zipErr) {
-        console.error('[UCE][ZIP] FAILED to generate ZIP:', zipErr);
-        console.log('[UCE][ZIP] Falling back to individual file downloads...');
-
-        // Fallback: download TXT and JSON individually
-        const txtBlob = new Blob([txtOutput], { type: 'text/plain;charset=utf-8' });
-        const txtUrl = URL.createObjectURL(txtBlob);
-        const txtLink = document.createElement('a');
-        txtLink.href = txtUrl;
-        txtLink.download = `upwork-chat-${safeName}-${dateStr}.txt`;
-        document.body.appendChild(txtLink);
-        txtLink.click();
-        document.body.removeChild(txtLink);
-        URL.revokeObjectURL(txtUrl);
-        console.log('[UCE][Fallback] TXT downloaded');
+      } catch (downloadErr) {
+        console.error('%c[UCE] FILE DOWNLOAD PHASE FAILED', 'color:red;font-weight:bold');
+        console.error('[UCE] Error:', downloadErr.message);
+        console.error('[UCE] Stack:', downloadErr.stack);
+        console.log('%c[UCE] Your conversation TEXT was already saved in the earlier download!', 'color:#14a800;font-weight:bold');
+        ui.setStatus('File downloads failed, but text was saved!');
+        ui.setDetail(downloadErr.message);
       }
     } else {
-      console.log('[UCE][Output] No downloadable files, exporting TXT and JSON only');
-
-      const txtBlob = new Blob([txtOutput], { type: 'text/plain;charset=utf-8' });
-      const txtUrl = URL.createObjectURL(txtBlob);
-      const txtLink = document.createElement('a');
-      txtLink.href = txtUrl;
-      txtLink.download = `upwork-chat-${safeName}-${dateStr}.txt`;
-      document.body.appendChild(txtLink);
-      txtLink.click();
-      document.body.removeChild(txtLink);
-      URL.revokeObjectURL(txtUrl);
-      console.log('[UCE][Output] TXT download triggered');
-
-      const jsonBlob = new Blob([jsonOutput], { type: 'application/json;charset=utf-8' });
-      const jsonUrl = URL.createObjectURL(jsonBlob);
-      const jsonLink = document.createElement('a');
-      jsonLink.href = jsonUrl;
-      jsonLink.download = `upwork-chat-${safeName}-${dateStr}.json`;
-      document.body.appendChild(jsonLink);
-      jsonLink.click();
-      document.body.removeChild(jsonLink);
-      URL.revokeObjectURL(jsonUrl);
-      console.log('[UCE][Output] JSON download triggered');
-    }
-
-    // Copy text to clipboard
-    try {
-      await navigator.clipboard.writeText(txtOutput);
-      console.log('[UCE] Text copied to clipboard');
-    } catch (e) {
-      console.warn('[UCE] Clipboard copy failed:', e.message);
+      console.log('[UCE][Output] No downloadable files, text-only export');
+      // Also download JSON
+      downloadBlob(
+        new Blob([jsonOutput], { type: 'application/json;charset=utf-8' }),
+        `upwork-chat-${safeName}-${dateStr}.json`
+      );
     }
 
     ui.setProgress(100);
     ui.setStatus('Export complete!');
-    ui.setDetail(`${data.messages.length} messages, ${downloadableFiles.length} files exported`);
+    ui.setDetail(`${data.messages.length} messages, ${totalDownloaded} files exported`);
 
     console.log('%c[UCE] ========== EXPORT COMPLETE ==========', 'color:#14a800;font-weight:bold;font-size:14px');
     console.log(`[UCE] Messages: ${data.messages.length}`);
-    console.log(`[UCE] Files downloaded: ${downloadableFiles.length}`);
+    console.log(`[UCE] Files downloaded: ${totalDownloaded}/${downloadableFiles.length}`);
     console.log(`[UCE] First message: ${data.messages[0]?.date || 'unknown'} - ${data.messages[0]?.sender || 'unknown'}`);
     console.log(`[UCE] Last message: ${data.messages[data.messages.length - 1]?.date || 'unknown'} - ${data.messages[data.messages.length - 1]?.sender || 'unknown'}`);
     console.log(`[UCE] First message preview: "${data.messages[0]?.text?.substring(0, 100)}..."`);
